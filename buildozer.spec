@@ -17,7 +17,7 @@ source.include_exts = py,png,jpg,kv,atlas
 
 # (list) List of inclusions using pattern matching
 #source.include_patterns = assets/*,images/*.png
-#source.include_patterns = assets/*,images/*.png
+source.include_patterns = ffmpeg/*
 
 # (list) Source files to exclude (let empty to not exclude anything)
 #source.exclude_exts = spec
@@ -38,7 +38,7 @@ version = 0.1
 
 # (list) Application requirements
 # comma separated e.g. requirements = sqlite3,kivy
-requirements = python3,kivy,yt-dlp,ffmpeg,pyjnius,android,cython==0.29.33,requests,urllib3
+requirements = python3,kivy,yt-dlp,pyjnius,android,cython==0.29.33,requests,urllib3
 
 # Force python-for-android to use a specific Cython version
 p4a.cython = 0.29.33
@@ -111,9 +111,9 @@ android.permissions = android.permission.INTERNET, android.permission.WRITE_EXTE
 #android.features = android.hardware.usb.host
 
 # (int) Target Android API, should be as high as possible.
-android.api = 31
+android.api = 33
 
-# (int) Minimum API your APK / AAB will support.
+# (int) Minimum API your APK / AAB will support.sl 
 android.minapi = 24
 
 # (int) Android SDK version to use
@@ -123,7 +123,7 @@ android.sdk = 33
 android.ndk = 25b
 
 # (int) Android NDK API to use. This is the minimum API your app will support, it should usually match android.minapi.
-#android.ndk_api = 21
+android.ndk_api = 24
 
 # (bool) Use --private data storage (True) or --dir public storage (False)
 #android.private_storage = True
@@ -211,12 +211,12 @@ android.ndk = 25b
 #android.add_resources =
 
 # (list) Gradle dependencies to add
-#android.gradle_dependencies =
+# android.gradle_dependencies = com.arthenica:ffmpeg-kit-full:5.1.LTS
 
 # (bool) Enable AndroidX support. Enable when 'android.gradle_dependencies'
 # contains an 'androidx' package, or any package from Kotlin source.
 # android.enable_androidx requires android.api >= 33
-#android.enable_androidx = True
+android.enable_androidx = True
 
 # (list) add java compile options
 # this can for example be necessary when importing certain java libraries using the 'android.gradle_dependencies' option
@@ -225,8 +225,8 @@ android.ndk = 25b
 
 # (list) Gradle repositories to add {can be necessary for some android.gradle_dependencies}
 # please enclose in double quotes 
-# e.g. android.gradle_repositories = "maven { url 'https://kotlin.bintray.com/ktor' }"
-#android.add_gradle_repositories =
+# e.g. android.add_gradle_repositories = "maven { url 'https://kotlin.bintray.com/ktor' }"
+android.add_gradle_repositories = "mavenCentral()"
 
 # (list) packaging options to add 
 # see https://google.github.io/android-gradle-dsl/current/com.android.build.gradle.internal.dsl.PackagingOptions.html
@@ -361,6 +361,7 @@ p4a.bootstrap = sdl2
 # (str) extra command line arguments to pass when invoking pythonforandroid.toolchain
 p4a.extra_args = --ignore-setup-py
 
+p4a.extra_gradle_dependencies = com.arthenica:ffmpeg-kit-full:5.1.LTS
 
 
 #

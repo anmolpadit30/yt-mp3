@@ -2,6 +2,8 @@ import os
 import sys
 import threading
 import traceback
+import subprocess
+import shutil
 from dataclasses import dataclass
 from typing import List
 
@@ -26,9 +28,14 @@ from kivy.uix.button import Button
 from kivy.clock import Clock
 from kivy.metrics import dp
 from kivy.logger import Logger
+from kivy.utils import platform
 
 # yt-dlp core
 from yt_dlp import YoutubeDL
+
+# Remove Python-level ffmpeg-kit import (not available via pip). We'll use Java API via pyjnius on Android.
+FFmpegKit = None
+ReturnCode = None
 
 # Custom logger for yt-dlp -> Kivy Logger
 class YDLLogger:
@@ -129,6 +136,81 @@ def ensure_android_permissions():
     else:
         Logger.info("ensure_android_permissions: All permissions granted")
 
+# ---------- FFmpeg helpers ----------
+
+# def get_ffmpeg_path() -> str:
+#     """
+#     Returns usable ffmpeg binary path.
+#     """
+#     if platform == "android":
+#         from android.storage import app_storage_path
+#         app_path = app_storage_path()
+#         ffmpeg_src = os.path.join(os.path.dirname(__file__), "ffmpeg", "ffmpeg")
+#         ffmpeg_dst = os.path.join(app_path, "ffmpeg")
+
+#         if not os.path.exists(ffmpeg_dst):
+#             try:
+#                 shutil.copy(ffmpeg_src, ffmpeg_dst)
+#                 os.chmod(ffmpeg_dst, 0o755)
+#                 Logger.info(f"get_ffmpeg_path: Copied ffmpeg to {ffmpeg_dst}")
+#             except Exception as e:
+#                 Logger.error(f"get_ffmpeg_path: Failed to copy ffmpeg: {e}")
+#         return ffmpeg_dst
+#     else:
+#         return "ffmpeg"
+
+
+def convert_to_mp3(input_file: str, output_file: str) -> str:
+    """
+    Convert input_file to MP3 at output_file.
+    - On Android: call Java FFmpegKit (provided by Gradle dep com.arthenica:ffmpeg-kit-full)
+    - Elsewhere: use system ffmpeg if available
+    """
+    # Ensure destination directory exists
+    try:
+        os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    except Exception:
+        pass
+
+    cmd_args = ['-y', '-i', input_file, '-vn', '-codec:a', 'libmp3lame', '-qscale:a', '2', output_file]
+    cmd_str = ' '.join([f'"{a}"' if ' ' in str(a) else str(a) for a in cmd_args])
+
+    # Android path: use Java FFmpegKit via pyjnius
+    if 'ANDROID_ARGUMENT' in os.environ:
+        try:
+            FFmpegKitJava = autoclass('com.arthenica.ffmpegkit.FFmpegKit')
+            ReturnCodeJava = autoclass('com.arthenica.ffmpegkit.ReturnCode')
+        except Exception as e:
+            Logger.error(f"convert_to_mp3: FFmpegKit Java classes not available: {e}")
+            return ""
+
+        Logger.info(f"[convert_to_mp3] Running (FFmpegKit): ffmpeg {cmd_str}")
+        try:
+            session = FFmpegKitJava.execute(cmd_str)
+            rc = session.getReturnCode()
+            if ReturnCodeJava.isSuccess(rc):
+                Logger.info(f"✅ Converted: {os.path.basename(output_file)}")
+                return output_file
+            else:
+                try:
+                    logs = session.getAllLogsAsString()
+                except Exception:
+                    logs = ""
+                Logger.error(f"convert_to_mp3: Conversion failed. ReturnCode={rc} Logs={logs}")
+                return ""
+        except Exception as e:
+            Logger.error(f"convert_to_mp3: Exception during FFmpegKit execution: {e}")
+            return ""
+
+    # Non-Android path: try system ffmpeg
+    try:
+        Logger.info(f"[convert_to_mp3] Running (ffmpeg cli): ffmpeg {cmd_str}")
+        subprocess.run(['ffmpeg'] + cmd_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        Logger.info(f"✅ Converted: {os.path.basename(output_file)}")
+        return output_file
+    except Exception as e:
+        Logger.error(f"convert_to_mp3: CLI ffmpeg failed: {e}")
+        return ""
 
 # ---------- yt-dlp helpers ----------
 
@@ -137,15 +219,6 @@ class DownloadTask:
     url: str
     output_dir: str
     is_playlist: bool
-    # def __init__(self, url, output_dir, is_playlist):
-    #     self.output_dir = output_dir
-    #     self.is_playlist = is_playlist
-    #     if is_playlist==True:
-    #         self.urls = extract_playlist_urls(url)
-    #     else:
-    #         self.urls = [url]
-
-
 
 def is_playlist_url(url: str) -> bool:
     return "playlist" in url.lower() or "list=" in url.lower()
@@ -207,7 +280,6 @@ def build_ydl_opts(output_dir: str, update_status, update_progress, single_video
 
 
 def progress_hook(d, update_status, update_progress):
-    # d['status'] in {'downloading','finished','error'}
     status = d.get("status", "")
     if status == "downloading":
         total = d.get("total_bytes") or d.get("total_bytes_estimate")
@@ -328,17 +400,32 @@ class Root(BoxLayout):
                     ydl_opts = build_ydl_opts(task.output_dir, update_status, update_progress, single_video=True)
                     with YoutubeDL(ydl_opts) as ydl:
                         ydl.download([vurl])
+                    self._convert_all(task.output_dir, update_status)
                 update_status(f"✅ Done. Saved to: {task.output_dir}")
             else:
                 ydl_opts = build_ydl_opts(task.output_dir, update_status, update_progress, single_video=True)
                 with YoutubeDL(ydl_opts) as ydl:
                     ydl.download([task.url])
+                self._convert_all(task.output_dir, update_status)
                 update_status(f"✅ Done. Saved to: {task.output_dir}")
         except Exception as e:
             Logger.error(f"DownloadTask: Error occurred: {e}")
             Logger.error(f"DownloadTask: Traceback: {traceback.format_exc()}")
             update_status(f"❌ Error: {e}")
 
+    def _convert_all(self, output_dir, update_status):
+        update_status("Converting to MP3…")
+        for file in os.listdir(output_dir):
+            if file.endswith(".webm") or file.endswith(".m4a"):
+                input_path = os.path.join(output_dir, file)
+                base = os.path.splitext(os.path.basename(file))[0]
+                output_path = os.path.join(output_dir, base + ".mp3")
+                mp3_path = convert_to_mp3(input_path, output_path)
+                if mp3_path:
+                    try:
+                        os.remove(input_path)
+                    except Exception:
+                        pass
 
 class YouTubeMP3App(App):
     def build(self):
