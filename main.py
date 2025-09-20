@@ -309,7 +309,9 @@ def extract_playlist_urls(playlist_url: str) -> List[str]:
         entries = info.get("entries") or []
         for e in entries:
             vid = e.get("url")
-            if vid:
+            if vid and 'watch?v=' in vid:
+                urls.append(vid)
+            else:
                 urls.append(f"https://www.youtube.com/watch?v={vid}")
     return urls
 
