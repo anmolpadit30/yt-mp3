@@ -38,7 +38,7 @@ version = 0.1
 
 # (list) Application requirements
 # comma separated e.g. requirements = sqlite3,kivy
-requirements = python3,kivy,yt-dlp,ffmpeg,pyjnius,android,cython==0.29.33,requests,urllib3
+requirements = python3,kivy,pyjnius,yt-dlp,python-vlc,pyjnius,android,cython==0.29.33,requests,urllib3
 
 # Force python-for-android to use a specific Cython version
 p4a.cython = 0.29.33
@@ -58,7 +58,7 @@ p4a.cython = 0.29.33
 orientation = portrait
 
 # (list) List of service to declare
-#services = NAME:ENTRYPOINT_TO_PY,NAME2:ENTRYPOINT2_TO_PY
+services = musicservice:service.py
 
 #
 # OSX Specific
@@ -105,7 +105,9 @@ fullscreen = 0
 
 # (list) Permissions
 # (See https://python-for-android.readthedocs.io/en/latest/buildoptions/#build-options-1 for all the supported syntaxes and properties)
-android.permissions = android.permission.INTERNET, android.permission.WRITE_EXTERNAL_STORAGE, android.permission.READ_EXTERNAL_STORAGE
+android.permissions = android.permission.INTERNET, android.permission.WAKE_LOCK, android.permission.FOREGROUND_SERVICE, android.permission.BLUETOOTH, android.permission.BLUETOOTH_ADMIN, android.permission.ACCESS_NETWORK_STATE
+
+#
 
 # (list) features (adds uses-feature -tags to manifest)
 #android.features = android.hardware.usb.host
@@ -190,7 +192,7 @@ android.ndk = 25b
 #android.add_src =
 
 # (list) Android AAR archives to add
-#android.add_aars =
+android.add_aars = libs/vlc/libvlc-all-3.6.aar
 
 # (list) Put these files or directories in the apk assets directory.
 # Either form may be used, and assets need not be in 'source.include_exts'.
@@ -267,7 +269,7 @@ android.ndk = 25b
 
 # (bool) Indicate whether the screen should stay on
 # Don't forget to add the WAKE_LOCK permission if you set this to True
-#android.wakelock = False
+android.wakelock = True
 
 # (list) Android application meta-data to set (key=value format)
 #android.meta_data =

@@ -1,0 +1,152 @@
+#:import dp kivy.metrics.dp
+
+<Root>:
+    orientation: "vertical"
+    padding: dp(14)
+    spacing: dp(10)
+    pos_hint: {'top': 1}
+
+    Label:
+        text: "YouTube Music Player & Downloader"
+        font_size: "20sp"
+        size_hint_y: None
+        height: dp(32)
+
+    TextInput:
+        id: input
+        hint_text: "Paste a YouTube Video or Playlist URL"
+        multiline: False
+        size_hint_y: None
+        height: dp(44)
+
+    BoxLayout:
+        size_hint_y: None
+        height: dp(44)
+        spacing: dp(10)
+        Button:
+            id: stream_btn
+            text: "Stream"
+            on_press: root.on_stream()
+        Button:
+            id: download_btn
+            text: "Download MP3"
+            on_press: root.on_download()
+
+    BoxLayout:
+        size_hint_y: None
+        size_hint_x: 1
+        height: dp(44)
+        spacing: dp(10)
+        
+        Button:
+            id: autoplay_btn
+            text: "Auto: ON"
+            size_hint_y: None
+            height: dp(32)
+            size_hint_x: 0.2
+            on_press:
+                self.text = "Auto-Play: " + ("OFF" if self.text.endswith("ON") else "ON")
+                # toggling is handled in Python if needed (you can add root.toggle_autoplay())
+
+
+        BoxLayout:
+            size_hint_x: 0.3
+            size_hint_y: None
+            height: dp(32)
+            orientation: "horizontal"
+            Label:
+                text: "Vol:"
+                size_hint_x: 0.3
+            Slider:
+                id: volume_slider
+                min: 0
+                max: 100
+                value: 70
+                size_hint_x: 0.5
+        AnchorLayout:
+            size_hint_x: 0.3
+            size_hint_y: None
+            height: dp(32)
+            orientation: "horizontal"
+            anchor_x: 'right'
+            Button:
+                id: burger_btn
+                text: "Playlist"
+                size_hint_y: None
+                height: dp(32)
+                size_hint_x: None
+                width: dp(100)
+                on_press: root.open_playlist_popup()
+
+    BoxLayout:
+        orientation: "vertical"
+        size_hint_y: None
+        height: dp(250)
+        spacing: dp(5)
+
+        Label:
+            id: track_title
+            text: "No track loaded"
+            font_size: "16sp"
+            size_hint_y: None
+            height: dp(30)
+
+        ProgressBar:
+            id: progress_bar
+            max: 100
+            value: 0
+            size_hint_y: None
+            height: dp(20)
+            # allow seeking - call root.on_seek when user lifts finger
+            on_touch_up:
+                if self.collide_point(*args[1].pos): root.on_seek(self, args[1])
+
+        BoxLayout:
+            size_hint_y: None
+            height: dp(25)
+            Label:
+                id: current_time
+                text: "0:00"
+                size_hint_x: 0.5
+            Label:
+                id: total_time
+                text: "0:00"
+                size_hint_x: 0.5
+                halign: "right"
+
+        BoxLayout:
+            size_hint_y: None
+            height: dp(50)
+            spacing: dp(10)
+
+            Button:
+                id: prev_btn
+                text: "<<"
+                on_press: root.on_previous()
+            Button:
+                id: play_btn
+                text: ">"
+                on_press: root.on_play_pause()
+            Button:
+                id: stop_btn
+                text: "X"
+                on_press: root.on_stop()
+            Button:
+                id: next_btn
+                text: ">>"
+                on_press: root.on_next()
+
+    Label:
+        id: status
+        text: ""
+        size_hint_y: None
+        height: dp(26)
+
+    Label:
+        id: progress
+        text: ""
+        size_hint_y: None
+        height: dp(24)
+
+    Widget:
+        size_hint_y: 1
