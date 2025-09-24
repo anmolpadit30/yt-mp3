@@ -1,18 +1,14 @@
 import os
 import sys
 import threading
-import traceback
 import time
+import json
 from dataclasses import dataclass
 from typing import List
 
-# Configure Kivy before importing other Kivy modules
-try:
-    from kivy.config import Config
-    Config.set('kivy', 'keyboard_mode', 'system')
-except Exception:
-    pass
-
+# --- Kivy and platform setup ---
+from kivy.config import Config
+Config.set('kivy', 'keyboard_mode', 'system')
 from kivy.core.window import Window
 try:
     Window.softinput_mode = 'pan'
@@ -30,28 +26,7 @@ from kivy.uix.button import Button
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.label import Label
 
-from jnius import autoclass
-
-# Audio playback (desktop) - optional: python-vlc
-try:
-    import vlc
-    VLC_AVAILABLE = True
-except Exception:
-    VLC_AVAILABLE = False
-    Logger.warning("python-vlc not available, audio playback will be limited on desktop; on Android you should use ffpyplayer or Android native APIs")
-
-# yt-dlp core
-from yt_dlp import YoutubeDL
-
-# ---------- Utility & helpers (unchanged logic, slightly adapted) ----------
-
-@dataclass
-class DownloadTask:
-    url: str
-    output_dir: str
-    is_playlist: bool
-
-# Android guard (keeps code runnable on desktop)
+# --- Platform-specific imports and setup ---
 try:
     from android.permissions import request_permissions, Permission, check_permission
     from jnius import autoclass
@@ -59,189 +34,245 @@ try:
     PythonService = autoclass('org.kivy.android.PythonService')
 except Exception:
     ANDROID = False
-    class MockPermission:
-        INTERNET = "android.permission.INTERNET"
-        WRITE_EXTERNAL_STORAGE = "android.permission.WRITE_EXTERNAL_STORAGE"
-        READ_EXTERNAL_STORAGE = "android.permission.READ_EXTERNAL_STORAGE"
-    Permission = MockPermission()
-    autoclass = None
-    PythonService = None
 
-def get_download_root() -> str:
+if ANDROID:
+    VLC_AVAILABLE = False
+else:
+    try:
+        import vlc
+        VLC_AVAILABLE = True
+    except Exception:
+        VLC_AVAILABLE = False
+        Logger.warning("python-vlc not found, playback will not work on desktop.")
+
+from yt_dlp import YoutubeDL
+
+# ---------- Player Classes (Platform-specific) ----------
+
+class WindowsPlayer:
+    def __init__(self, on_completion_callback=None):
+        if not VLC_AVAILABLE:
+            raise RuntimeError("VLC is not available.")
+        self.vlc_instance = vlc.Instance()
+        self.player = self.vlc_instance.media_player_new()
+        self.on_completion_callback = on_completion_callback
+        
+        if self.on_completion_callback:
+            events = self.player.event_manager()
+            events.event_attach(vlc.EventType.MediaPlayerEndReached, self._on_completion)
+
+    def _on_completion(self, event):
+        Logger.info("WindowsPlayer: Playback completed.")
+        if self.on_completion_callback:
+            Clock.schedule_once(lambda dt: self.on_completion_callback())
+
+    def play(self, file_path):
+        media = self.vlc_instance.media_new(file_path)
+        self.player.set_media(media)
+        self.player.play()
+
+    def pause(self):
+        self.player.pause()
+
+    def resume(self):
+        self.player.play()
+
+    def stop(self):
+        self.player.stop()
+
+    def seek(self, position_sec):
+        self.player.set_time(int(position_sec * 1000))
+
+    def get_position(self):
+        return self.player.get_time() / 1000.0
+
+    def get_duration(self):
+        return self.player.get_length() / 1000.0
+
+    def is_playing(self):
+        return self.player.get_state() == vlc.State.Playing
+        
+    def set_volume(self, volume):
+        self.player.audio_set_volume(volume)
+
+    def release(self):
+        if self.player:
+            self.player.release()
+            self.player = None
+
+class AndroidPlayerInterface:
+    def __init__(self):
+        self.app_files_dir = App.get_running_app().user_data_dir
+        self.cmd_file = os.path.join(self.app_files_dir, "service_cmd.txt")
+
+    def _send_command(self, command):
+        Logger.info(f"Sending command to service: {command}")
+        try:
+            with open(self.cmd_file, "w") as f:
+                f.write(command)
+            os.utime(self.cmd_file, None)
+        except Exception as e:
+            Logger.error(f"Failed to send command to service: {e}")
+
+    def play(self, file_path):
+        self._send_command(f"PLAY|{file_path}")
+
+    def pause(self):
+        self._send_command("PAUSE")
+
+    def resume(self):
+        self._send_command("RESUME")
+
+    def stop(self):
+        self._send_command("STOP")
+
+    def seek(self, position_sec):
+        self._send_command(f"SEEK|{position_sec}")
+
+    def release(self):
+        self.stop()
+
+# ---------- Utility & helpers ----------
+
+@dataclass
+class DownloadTask:
+    url: str
+    output_dir: str
+    is_playlist: bool
+
+def get_app_files_dir() -> str:
+    if ANDROID:
+        return App.get_running_app().user_data_dir
+    else:
+        target = os.path.join(os.path.abspath(os.getcwd()), "data")
+        os.makedirs(target, exist_ok=True)
+        return target
+
+def get_public_downloads_dir() -> str:
     if ANDROID:
         try:
             Environment = autoclass('android.os.Environment')
-            downloads_dir_obj = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-            if downloads_dir_obj is not None:
-                target = downloads_dir_obj.getAbsolutePath()
-            else:
-                storage_root_obj = Environment.getExternalStorageDirectory()
-                storage_root = storage_root_obj.getAbsolutePath() if storage_root_obj else "/sdcard"
-                target = os.path.join(storage_root, "Download")
+            return Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS).getAbsolutePath()
         except Exception as e:
-            Logger.error(f"get_download_root: {e}")
-            target = "/sdcard/Download"
+            Logger.error(f"get_public_downloads_dir: {e}")
+            # Fallback to a public but app-specific directory if the above fails
+            context = autoclass('org.kivy.android.PythonActivity').mActivity.getApplicationContext()
+            return context.getExternalFilesDir(None).getAbsolutePath()
     else:
         target = os.path.join(os.path.abspath(os.getcwd()), "downloads")
-    os.makedirs(target, exist_ok=True)
-    return target
-
-def ensure_android_permissions():
-    if not ANDROID:
-        return
-    perms = [Permission.INTERNET, Permission.WRITE_EXTERNAL_STORAGE, Permission.READ_EXTERNAL_STORAGE]
-    missing = [p for p in perms if not check_permission(p)]
-    if missing:
-        request_permissions(perms)
+        os.makedirs(target, exist_ok=True)
+        return target
 
 def get_temp_dir() -> str:
-    temp_dir = os.path.join(get_download_root(), "temp_streaming")
+    temp_dir = os.path.join(get_app_files_dir(), "temp_streaming")
     os.makedirs(temp_dir, exist_ok=True)
     return temp_dir
 
-def cleanup_temp_files():
-    try:
-        temp_dir = get_temp_dir()
-        now = time.time()
-        for f in os.listdir(temp_dir):
-            if f.startswith("temp_"):
-                path = os.path.join(temp_dir, f)
-                try:
-                    if now - os.path.getmtime(path) > 1800:
-                        os.remove(path)
-                        Logger.info(f"cleanup_temp_files: removed {f}")
-                except Exception:
-                    pass
-    except Exception as e:
-        Logger.warning(f"cleanup_temp_files: {e}")
-
-def manage_storage_size():
-    try:
-        temp_dir = get_temp_dir()
-        max_size = 1024 * 1024 * 1024
-        files = []
-        total = 0
-        for f in os.listdir(temp_dir):
-            if f.startswith("temp_"):
-                path = os.path.join(temp_dir, f)
-                try:
-                    size = os.path.getsize(path)
-                    mtime = os.path.getmtime(path)
-                    files.append((path, size, mtime))
-                    total += size
-                except Exception:
-                    pass
-        if total > max_size:
-            files.sort(key=lambda x: x[2])
-            freed = 0
-            for path, size, _ in files:
-                if total - freed <= max_size:
-                    break
-                try:
-                    os.remove(path)
-                    freed += size
-                    Logger.info(f"manage_storage_size: removed {os.path.basename(path)}")
-                except Exception:
-                    pass
-    except Exception as e:
-        Logger.warning(f"manage_storage_size: {e}")
-
-# yt-dlp helpers
 class YDLLogger:
     def debug(self, msg): Logger.info(f"yt_dlp: {msg}")
     def warning(self, msg): Logger.warning(f"yt_dlp: {msg}")
     def error(self, msg): Logger.error(f"yt_dlp: {msg}")
 
-def is_playlist_url(url: str) -> bool:
-    return "playlist" in url.lower() or "list=" in url.lower()
+def is_playlist_url(url: str) -> bool: return "playlist" in url.lower() or "list=" in url.lower()
 
-def extract_playlist_urls(playlist_url: str) -> List[str]:
-    opts = {"quiet": True, "extract_flat": True, "skip_download": True}
-    urls = []
+def extract_playlist_info(playlist_url: str) -> (list, list):
+    opts = {"quiet": True, "extract_flat": "in_playlist", "skip_download": True}
+    urls, titles = [], []
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(playlist_url, download=False)
-        entries = info.get("entries") or []
-        for e in entries:
-            vid = e.get("url")
-            if vid and 'watch?v=' in vid:
-                urls.append(vid)
-            else:
-                urls.append(f"https://www.youtube.com/watch?v={vid}")
-    return urls
+        if info and 'entries' in info:
+            for e in info.get('entries', []):
+                if e and e.get('id'):
+                    urls.append(f"https://www.youtube.com/watch?v={e['id']}")
+                    titles.append(e.get('title', 'Unknown Title'))
+    return urls, titles
 
-def download_for_streaming(video_url: str, progress_callback=None) -> tuple:
-    """
-    Downloads the best audio into a temp file and returns (file_path, title, duration)
-    This function avoids FFmpeg postprocessing for streaming.
-    """
+def download_for_streaming(video_url: str):
     try:
         temp_dir = get_temp_dir()
-
-        # get safe title & extension without downloading
-        opts_info = {"quiet": True, "no_warnings": True, "format": "bestaudio/best", "skip_download": True}
+        opts_info = {"quiet": True, "no_warnings": True, "format": "bestaudio[ext=m4a]/bestaudio/best", "skip_download": True, "logger": YDLLogger()}
         with YoutubeDL(opts_info) as ydl:
             info = ydl.extract_info(video_url, download=False)
-            if not info:
-                return None, None, None
-            title = info.get('title', 'unknown')
-            duration = info.get('duration', 0)
-            ext = info.get('ext', 'm4a')
-
+            if not info: return None, None, None
+            title, duration, ext = info.get('title', 'unknown'), info.get('duration', 0), info.get('ext', 'm4a')
+        
         safe_title = "".join(c if c.isalnum() or c in " ._-" else "_" for c in title)
-        temp_filename = f"temp_{safe_title}.{ext}"
-        temp_path = os.path.join(temp_dir, temp_filename)
-
+        temp_path = os.path.join(temp_dir, f"temp_{safe_title}.{ext}")
+        
         if os.path.exists(temp_path):
             return temp_path, title, duration
-
-        def _progress(d):
-            if progress_callback:
-                progress_callback(d)
-
-        opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "format": "bestaudio/best",
-            "outtmpl": temp_path,
-            "progress_hooks": [lambda d: _progress(d)],
-        }
-
+            
+        opts = {"quiet": True, "no_warnings": True, "format": "bestaudio[ext=m4a]/bestaudio/best", "outtmpl": temp_path, "logger": YDLLogger()}
         with YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(video_url, download=True)
-            if not info:
-                return None, None, None
-
-        if os.path.exists(temp_path):
-            return temp_path, title, duration
-        return None, None, None
-
+            ydl.extract_info(video_url, download=True)
+            
+        return (temp_path, title, duration) if os.path.exists(temp_path) else (None, None, None)
     except Exception as e:
         Logger.error(f"download_for_streaming: {e}")
         return None, None, None
 
-# ---------- KV & Root wiring ----------
-# We'll load main.kv explicitly in App.build() so user can name the file "main.kv".
+# ---------- Service Management ----------
+service_running = False
+def start_music_service():
+    global service_running
+    if ANDROID and not service_running:
+        try:
+            activity = autoclass('org.kivy.android.PythonActivity').mActivity
+            intent = autoclass('android.content.Intent')(activity, PythonService)
+            
+            app_root = os.path.dirname(os.path.abspath(__file__))
+            intent.putExtra('android.PythonService.ARGUMENT', app_root)
+            intent.putExtra('android.PythonService.ENTRYPOINT', 'service.py')
+            
+            activity.startService(intent)
+            service_running = True
+            Logger.info("start_music_service: Service intent sent.")
+        except Exception as e:
+            Logger.error(f"start_music_service: {e}")
+
+def stop_music_service():
+    global service_running
+    if ANDROID and service_running:
+        try:
+            activity = autoclass('org.kivy.android.PythonActivity').mActivity
+            intent = autoclass('android.content.Intent')(activity, PythonService)
+            activity.stopService(intent)
+            service_running = False
+        except Exception as e:
+            Logger.error(f"stop_music_service: {e}")
+
+# ---------- Main App ----------
 
 class Root(BoxLayout):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        # playback state
-        self.media_player = None
+        self.player = None
         self.is_playing = False
         self.current_file = None
         self.current_title = None
         self.current_duration = 0
-        self.progress_event = None
-        self.playlist_urls = ['https://www.youtube.com/watch?v=CprWhVqZFPA', 'https://www.youtube.com/watch?v=-kt1yB3Lk9g', 'https://www.youtube.com/watch?v=t36HlL4A7m0']
+        self.playlist_urls = []
+        self.playlist_titles = []
         self.current_index = 0
         self._worker = None
-        self.autoplay_enabled = True  # Add autoplay state
+        self.autoplay_enabled = True
+        self.progress_event = None
+        
+        self.status_file = None
+        self.last_status_mtime = 0
+        self.last_status_data = {}
+
+        if ANDROID:
+            self.player = AndroidPlayerInterface()
+            self.status_file = os.path.join(App.get_running_app().user_data_dir, "service_status.json")
+            ensure_android_permissions()
+            start_music_service()
+        elif VLC_AVAILABLE:
+            self.player = WindowsPlayer(on_completion_callback=self.on_playback_finished)
+        else:
+            Logger.error("No player available for this platform.")
 
     def on_kv_post(self, base_widget):
-        """
-        Called after KV has been applied. Grab references from ids.
-        """
-        # grab commonly used widgets as attributes for old code compatibility
         self.input = self.ids.input
         self.stream_btn = self.ids.stream_btn
         self.download_btn = self.ids.download_btn
@@ -255,452 +286,277 @@ class Root(BoxLayout):
         self.current_time = self.ids.current_time
         self.total_time = self.ids.total_time
         self.status = self.ids.status
-        self.progress = self.ids.progress
-        self.autoplay_btn = self.ids.autoplay_btn  # Add autoplay button reference
-
-        # ensure the volume slider changes audio volume
-        try:
-            self.volume_slider.bind(value=self.on_volume_change)
-        except Exception:
-            pass
-
-        # initial UI
+        self.autoplay_btn = self.ids.autoplay_btn
+        
+        self.volume_slider.bind(value=self.on_volume_change)
         self.track_title.text = "No track loaded"
-        self.status.text = ""
-        self.progress.text = ""
+        self.status.text = "Welcome!"
         self.total_time.text = "0:00"
         self.current_time.text = "0:00"
+        
+        self.progress_event = Clock.schedule_interval(self.update_progress, 0.5)
 
-    # UI-safe updaters
     def set_status(self, msg: str):
         Clock.schedule_once(lambda *_: setattr(self.status, "text", msg))
 
-    def set_progress(self, percent: int):
-        Clock.schedule_once(lambda *_: setattr(self.progress, "text", f"Progress: {percent}%"))
-
     def format_time(self, seconds: int) -> str:
-        minutes = int(seconds // 60)
-        seconds = int(seconds % 60)
-        return f"{minutes}:{seconds:02d}"
+        return f"{int(seconds // 60)}:{int(seconds % 60):02d}"
 
-    # streaming / playback handlers (adapted to use the ids attributes)
+    def on_playback_finished(self):
+        Logger.info("Root: Playback finished.")
+        self.stop_playback_ui()
+        if self.autoplay_enabled:
+            self.on_next()
+
     def on_stream(self, *_):
         url = (self.input.text or "").strip()
-        if not url:
-            self.set_status("❌ Please paste a YouTube URL first.")
-            return
-        if not VLC_AVAILABLE:
-            self.set_status("❌ python-vlc not available. Install it for desktop testing.")
-            return
-
-        # stop existing
-        self.stop_playback()
-
+        if not url: return
         if is_playlist_url(url):
-            self.set_status("Loading playlist...")
-            threading.Thread(target=self._load_playlist_for_streaming, args=(url,), daemon=True).start()
+            threading.Thread(target=self._load_playlist, args=(url,), daemon=True).start()
         else:
-            self.set_status("Loading track...")
-            threading.Thread(target=self._load_track_for_streaming, args=(url,), daemon=True).start()
+            threading.Thread(target=self._load_track, args=(url, True), daemon=True).start()
 
-    def _load_playlist_for_streaming(self, playlist_url):
-        try:
-            urls = extract_playlist_urls(playlist_url)
-            titles = []
-            with YoutubeDL({"quiet": True, "extract_flat": True, "skip_download": True}) as ydl:
-                info = ydl.extract_info(playlist_url, download=False)
-                entries = info.get("entries") or []
-                for e in entries:
-                    titles.append(e.get("title", "Unknown"))
-            self.playlist_urls = urls
-            self.playlist_titles = titles
-            self.current_index = 0
-            self.set_status(f"Playlist: {len(urls)} tracks")
-            # auto-load first track
-            file_path, title, duration = download_for_streaming(urls[0], lambda d: None)
-            if file_path:
-                Clock.schedule_once(lambda *_: self._on_track_loaded(file_path, title, duration))
-        except Exception as e:
-            Logger.error(f"_load_playlist_for_streaming: {e}")
-            self.set_status(f"❌ Error: {e}")
+    def _load_playlist(self, playlist_url):
+        self.set_status("Loading playlist...")
+        urls, titles = extract_playlist_info(playlist_url)
+        if not urls:
+            self.set_status("❌ Could not load playlist")
+            return
+        self.playlist_urls = urls
+        self.playlist_titles = titles
+        self.current_index = 0
+        self.set_status(f"Playlist: {len(urls)} tracks")
+        self._load_track(urls[0], is_new_stream=True)
 
-    def _load_track_for_streaming(self, video_url):
-        def progress_callback(d):
-            status = d.get("status", "")
-            if status == "downloading":
-                total = d.get("total_bytes") or d.get("total_bytes_estimate")
-                downloaded = d.get("downloaded_bytes", 0)
-                if total:
-                    pct = int(downloaded * 100 / total)
-                    Clock.schedule_once(lambda *_: self.set_status(f"Downloading... {pct}%"))
-
-        file_path, title, duration = download_for_streaming(video_url, progress_callback)
+    def _load_track(self, video_url, is_new_stream=False):
+        self.set_status("Downloading...")
+        file_path, title, duration = download_for_streaming(video_url)
         if file_path and title:
-            Clock.schedule_once(lambda *_: self._on_track_loaded(file_path, title, duration))
+            Clock.schedule_once(lambda *_: self._on_track_loaded(file_path, title, duration, is_new_stream))
         else:
-            Clock.schedule_once(lambda *_: self.set_status("❌ Failed to load track"))
+            self.set_status("❌ Failed to load track")
 
-    def _on_track_loaded(self, file_path, title, duration):
+    def _on_track_loaded(self, file_path, title, duration, is_new_stream=False):
+        self.on_stop()
         self.current_file = file_path
         self.current_title = title
         self.current_duration = duration
-
-        self.track_title.text = str(self.current_index+1)+'. '+(title[:50] + "..." if len(title) > 50 else title)
+        self.track_title.text = f"{self.current_index + 1}. {title[:50]}"
         self.total_time.text = self.format_time(duration)
         self.progress_bar.value = 0
         self.current_time.text = "0:00"
-
-        try:
-            # Wait for file to be ready
-            for _ in range(10):
-                if os.path.exists(file_path) and os.path.getsize(file_path) > 4 * 1024:
-                    break
-                time.sleep(0.1)
-
-            # Create VLC player
-            if self.media_player:
-                try:
-                    self.media_player.stop()
-                    self.media_player.release()
-                except Exception:
-                    pass
-            self.media_player = vlc.MediaPlayer(file_path)
-            self.media_player.audio_set_volume(int(self.volume_slider.value))
-            self.play_btn.text = ">"
-            self.is_playing = False
-            self.set_status("✅ Track loaded. Click play to start.")
-
-            # --- FIX: Auto-play if enabled ---
-            Logger.info(f"Autoplay enabled: {hasattr(self, 'autoplay_enabled')}, {self.autoplay_enabled}")
-            if hasattr(self, "autoplay_enabled") and self.autoplay_enabled:
-                self.on_play_pause()
-        except Exception as e:
-            Logger.error(f"_on_track_loaded: {e}")
-            self.set_status(f"❌ Error loading: {e}")
-            self.media_player = None
+        self.set_status("✅ Track loaded.")
+        if self.autoplay_enabled and is_new_stream:
+            self.on_play_pause()
 
     def on_play_pause(self, *_):
-        if not self.media_player:
+        if not self.current_file:
             self.set_status("❌ No track loaded")
             return
-        try:
-            state = self.media_player.get_state()
-            if state in [vlc.State.Paused, vlc.State.Stopped, vlc.State.Ended]:
-                self.media_player.play()
-                self.is_playing = True
-                self.play_btn.text = "||"
-                if not self.progress_event:
-                    self.progress_event = Clock.schedule_interval(self.update_progress, 0.5)
-                self.set_status("▶ Playing")
-            elif state == vlc.State.Playing:
-                self.media_player.pause()
-                self.is_playing = False
-                self.play_btn.text = ">"
-                if self.progress_event:
-                    Clock.unschedule(self.progress_event)
-                    self.progress_event = None
-                self.set_status("⏸ Paused")
+            
+        if self.is_playing:
+            self.player.pause()
+            self.set_status("⏸ Paused")
+        else:
+            current_pos = self.get_current_position()
+            if current_pos > 1 and current_pos < self.current_duration -1:
+                 self.player.resume()
             else:
-                self.media_player.play()
-                self.is_playing = True
-                self.play_btn.text = "||"
-                if not self.progress_event:
-                    self.progress_event = Clock.schedule_interval(self.update_progress, 0.5)
-                self.set_status("▶ Playing")
-        except Exception as e:
-            Logger.error(f"on_play_pause: {e}")
-            self.set_status(f"❌ Error: {e}")
-
-    def update_progress(self, dt):
-        if not self.media_player:
-            return
-        try:
-            state = self.media_player.get_state()
-            if state == vlc.State.Playing:
-                pos = self.media_player.get_time() / 1000.0
-                duration = self.media_player.get_length() / 1000.0
-                if duration > 0 and pos >= 0:
-                    prog = (pos / duration) * 100
-                    self.ids.progress_bar.value = min(prog, 100)
-                    self.ids.current_time.text = self.format_time(int(pos))
-                    self.ids.total_time.text = self.format_time(int(duration))
-                    self.set_status("▶ Playing")
-            elif state == vlc.State.Paused:
-                self.set_status("⏸ Paused")
-            elif state in (vlc.State.Stopped, vlc.State.Ended):
-                self.stop_playback()
-                self.set_status("✅ Track finished")
-                # --- Auto-play next song if enabled and playlist exists ---
-                if getattr(self, "autoplay_enabled", False) and self.playlist_urls and self.current_index < len(self.playlist_urls) - 1:
-                    self.current_index += 1
-                    self.set_status("Auto-playing next track...")
-                    self._load_track_for_streaming(self.playlist_urls[self.current_index])
-        except Exception as e:
-            Logger.warning(f"update_progress: {e}")
+                 self.player.play(self.current_file)
+            self.set_status("▶ Playing")
+        
+        self.is_playing = not self.is_playing
+        self.play_btn.text = "||" if self.is_playing else ">"
 
     def on_stop(self, *_):
-        self.stop_playback()
+        if self.player:
+            self.player.stop()
+        self.stop_playback_ui()
+        self.set_status("⏹ Stopped")
 
-    def stop_playback(self):
-        if self.media_player:
-            try:
-                self.media_player.stop()
-                self.media_player.release()
-            except Exception:
-                pass
-            self.media_player = None
+    def stop_playback_ui(self):
         self.is_playing = False
         self.play_btn.text = ">"
         self.progress_bar.value = 0
         self.current_time.text = "0:00"
-        if self.progress_event:
-            Clock.unschedule(self.progress_event)
-            self.progress_event = None
 
-    def on_previous(self, *_):
-        if not self.playlist_urls or self.current_index <= 0:
-            self.set_status("❌ No previous track")
-            return
-        self.current_index -= 1
-        self.set_status("Loading previous track...")
-        threading.Thread(target=self._load_track_for_streaming, args=(self.playlist_urls[self.current_index],), daemon=True).start()
+    def update_progress(self, dt):
+        if ANDROID:
+            self.update_progress_android()
+        elif self.player:
+            self.update_progress_windows()
 
-    def on_next(self, *_):
-        if not self.playlist_urls or self.current_index >= len(self.playlist_urls) - 1:
-            self.set_status("❌ No next track")
-            return
-        self.current_index += 1
-        self.set_status("Loading next track...")
-        threading.Thread(target=self._load_track_for_streaming, args=(self.playlist_urls[self.current_index],), daemon=True).start()
+    def update_progress_windows(self):
+        if not self.player or not self.current_file: return
+
+        was_playing = self.is_playing
+        self.is_playing = self.player.is_playing()
+
+        if was_playing != self.is_playing:
+            self.play_btn.text = "||" if self.is_playing else ">"
+            self.set_status("▶ Playing" if self.is_playing else "⏸ Paused")
+
+        if self.is_playing:
+            pos = self.player.get_position()
+            if self.current_duration > 0:
+                self.progress_bar.value = (pos / self.current_duration) * 100
+            self.current_time.text = self.format_time(pos)
+
+    def update_progress_android(self):
+        if not self.status_file or not os.path.exists(self.status_file): return
+        
+        try:
+            current_mtime = os.path.getmtime(self.status_file)
+            if current_mtime <= self.last_status_mtime: return
+            
+            self.last_status_mtime = current_mtime
+            with open(self.status_file, "r") as f:
+                status = json.load(f)
+
+            if status.get("completed"):
+                if self.last_status_data.get("file_path") == status.get("file_path"):
+                    self.last_status_data = {}
+                    self.on_playback_finished()
+                return
+
+            self.last_status_data = status
+            
+            was_playing = self.is_playing
+            self.is_playing = status.get("is_playing", False)
+            
+            if was_playing != self.is_playing:
+                self.play_btn.text = "||" if self.is_playing else ">"
+                self.set_status("▶ Playing" if self.is_playing else "⏸ Paused")
+
+            pos = status.get("position", 0)
+            duration = status.get("duration", 0)
+            
+            if duration > 0:
+                self.progress_bar.value = (pos / duration) * 100
+                self.total_time.text = self.format_time(duration)
+            
+            self.current_time.text = self.format_time(pos)
+
+        except Exception as e:
+            Logger.error(f"Error reading status file: {e}")
+
+    def on_seek(self, instance, touch):
+        if instance.collide_point(*touch.pos) and self.current_duration > 0:
+            pct = max(0.0, min(1.0, (touch.pos[0] - instance.pos[0]) / instance.size[0]))
+            seek_time_sec = self.current_duration * pct
+            self.player.seek(seek_time_sec)
+            self.current_time.text = self.format_time(seek_time_sec)
+            self.progress_bar.value = pct * 100
 
     def on_volume_change(self, instance, value):
-        if self.media_player:
-            try:
-                self.media_player.audio_set_volume(int(value))
-            except Exception as e:
-                Logger.warning(f"on_volume_change: {e}")
+        if isinstance(self.player, WindowsPlayer):
+            self.player.set_volume(int(value))
+
+    def get_current_position(self) -> float:
+        if isinstance(self.player, WindowsPlayer):
+            return self.player.get_position()
+        elif ANDROID and self.last_status_data:
+            return self.last_status_data.get("position", 0)
+        return 0.0
+
+    def on_next(self, *_):
+        if not self.playlist_urls or self.current_index >= len(self.playlist_urls) - 1: return
+        self.current_index += 1
+        threading.Thread(target=self._load_track, args=(self.playlist_urls[self.current_index], True), daemon=True).start()
+
+    def on_previous(self, *_):
+        if not self.playlist_urls or self.current_index <= 0: return
+        self.current_index -= 1
+        threading.Thread(target=self._load_track, args=(self.playlist_urls[self.current_index], True), daemon=True).start()
 
     def on_download(self, *_):
         url = (self.input.text or "").strip()
-        if not url:
-            self.set_status("❌ Please paste a YouTube URL first.")
-            return
+        if not url: return
         ensure_android_permissions()
-        output_dir = get_download_root()
+        output_dir = get_public_downloads_dir()
         task = DownloadTask(url=url, output_dir=output_dir, is_playlist=is_playlist_url(url))
         if self._worker and self._worker.is_alive():
             self.set_status("⚠️ A download is already running.")
             return
         self.set_status("Starting download…")
-        self.set_progress(0)
         self._worker = threading.Thread(target=self._run_task, args=(task,), daemon=True)
         self._worker.start()
 
-    def on_seek(self, instance, touch):
-        # Called from KV progress_bar on_touch_up
-        if instance.collide_point(*touch.pos) and self.media_player and self.current_duration > 0:
-            rel_x = touch.pos[0] - instance.pos[0]
-            pct = rel_x / instance.size[0]
-            pct = max(0.0, min(1.0, pct))
-            seek_time = int(self.current_duration * pct)
-            try:
-                self.media_player.set_time(seek_time * 1000)
-                self.current_time.text = self.format_time(seek_time)
-                self.progress_bar.value = pct * 100
-            except Exception as e:
-                Logger.warning(f"on_seek: {e}")
-
-    def schedule_cleanup(self):
-        Clock.schedule_interval(lambda *_: cleanup_temp_files(), 300)
-        Clock.schedule_interval(lambda *_: manage_storage_size(), 600)
-
-    def toggle_autoplay(self, *_):
-        self.autoplay_enabled = not self.autoplay_enabled
-        self.autoplay_btn.text = f"Auto-Play: {'ON' if self.autoplay_enabled else 'OFF'}"
-
-    def cleanup_all_temp_files(self):
+    def _run_task(self, task: DownloadTask):
         try:
-            temp_dir = get_temp_dir()
-            for filename in os.listdir(temp_dir):
-                if filename.startswith("temp_"):
-                    file_path = os.path.join(temp_dir, filename)
-                    try:
-                        os.remove(file_path)
-                        Logger.info(f"cleanup_all_temp_files: Removed {filename}")
-                    except Exception as e:
-                        Logger.warning(f"cleanup_all_temp_files: Could not remove {filename}: {e}")
+            ydl_opts = {
+                "format": "bestaudio/best",
+                "outtmpl": os.path.join(task.output_dir, "%(title)s.%(ext)s"),
+                "noplaylist": not task.is_playlist,
+                "ignoreerrors": True,
+                "logger": YDLLogger(),
+                "quiet": True,
+            }
+            with YoutubeDL(ydl_opts) as ydl:
+                ydl.download([task.url])
+            self.set_status(f"✅ Done. Saved to: {task.output_dir}")
         except Exception as e:
-            Logger.error(f"cleanup_all_temp_files: Error during cleanup: {e}")
-
+            Logger.error(f"_run_task: {e}")
+            self.set_status(f"❌ Error: {e}")
+            
     def open_playlist_popup(self):
-        if not self.playlist_urls:
+        if not self.playlist_titles:
             self.set_status("No playlist loaded.")
             return
-
-        popup_layout = BoxLayout(orientation='vertical', spacing=5, padding=10)
-
-        # Top bar with close button
-        top_bar = BoxLayout(orientation='horizontal', size_hint_y=None, height=40)
+        popup_layout = BoxLayout(orientation='vertical', spacing=dp(5), padding=dp(10))
+        top_bar = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(48))
         top_bar.add_widget(Label(text="Playlist", size_hint_x=0.9))
         close_btn = Button(text="X", size_hint_x=0.1)
         top_bar.add_widget(close_btn)
         popup_layout.add_widget(top_bar)
-
-        # Song list
-        scroll = ScrollView(size_hint=(1, 1))
-        song_list = BoxLayout(orientation='vertical', size_hint_y=None)
+        scroll = ScrollView()
+        song_list = BoxLayout(orientation='vertical', size_hint_y=None, spacing=dp(5))
         song_list.bind(minimum_height=song_list.setter('height'))
-        # Logger.info(f"Opening playlist popup with {self.playlist_urls} songs")
-        for idx, url in enumerate(self.playlist_urls):
-            title = f"{idx+1}. {url}"
-            if hasattr(self, "playlist_titles") and self.playlist_titles and idx < len(self.playlist_titles):
-                title = f"{idx+1}. {self.playlist_titles[idx]}"
-            btn = Button(
-                text=title,
-                size_hint_y=None,
-                height=60,  # bigger so wrapping is visible
-                background_color=(0.2, 0.6, 1, 1) if idx == self.current_index else (1, 1, 1, 1),
-                color=(1, 1, 1, 1) if idx == self.current_index else (.9, .9, .9, 1),
-                halign="left",
-                valign="middle"
-            )
-
-            # enable wrapping
-            btn.text_size = (btn.width - 20, None)
-            btn.bind(width=lambda inst, val: setattr(inst, "text_size", (val - 20, None)))
-
+        for idx, title in enumerate(self.playlist_titles):
+            btn = Button(text=f"{idx+1}. {title}", size_hint_y=None, height=dp(60), halign="left", valign="middle")
+            btn.bind(width=lambda inst, val: setattr(inst, "text_size", (val - dp(20), None)))
             btn.bind(on_press=lambda inst, i=idx: self.select_playlist_song(i, popup))
+            if idx == self.current_index:
+                btn.background_color = (0.2, 0.6, 1, 1)
             song_list.add_widget(btn)
-
         scroll.add_widget(song_list)
         popup_layout.add_widget(scroll)
-
         popup = Popup(title="", content=popup_layout, size_hint=(.9, 0.9), auto_dismiss=False)
         close_btn.bind(on_press=popup.dismiss)
         popup.open()
-        self._playlist_popup = popup  # Save reference if needed
 
     def select_playlist_song(self, index, popup):
         popup.dismiss()
         self.current_index = index
-        self.set_status(f"Loading track {index+1}...")
-        threading.Thread(target=self._load_track_for_streaming, args=(self.playlist_urls[index],), daemon=True).start()
+        threading.Thread(target=self._load_track, args=(self.playlist_urls[self.current_index], True), daemon=True).start()
 
-    # background download task (unchanged)
-    def _run_task(self, task: DownloadTask):
-        def update_status(msg): self.set_status(msg)
-        def update_progress(p): self.set_progress(p)
-        try:
-            if task.is_playlist:
-                update_status("Fetching playlist…")
-                urls = extract_playlist_urls(task.url)
-                if not urls:
-                    update_status("❌ No videos in playlist.")
-                    return
-                for idx, vurl in enumerate(urls, 1):
-                    update_status(f"[{idx}/{len(urls)}] Downloading…")
-                    ydl_opts = {
-                        "format": "bestaudio/best",
-                        "outtmpl": os.path.join(task.output_dir, "%(title)s.%(ext)s"),
-                        "noplaylist": True,
-                        "ignoreerrors": True,
-                        "progress_hooks": [lambda d: progress_hook(d, update_status, update_progress)],
-                        "logger": YDLLogger(),
-                        "quiet": True,
-                        "no_warnings": True,
-                    }
-                    with YoutubeDL(ydl_opts) as ydl:
-                        ydl.download([vurl])
-                update_status(f"✅ Done. Saved to: {task.output_dir}")
-            else:
-                ydl_opts = {
-                    "format": "bestaudio/best",
-                    "outtmpl": os.path.join(task.output_dir, "%(title)s.%(ext)s"),
-                    "noplaylist": True,
-                    "ignoreerrors": True,
-                    "progress_hooks": [lambda d: progress_hook(d, update_status, update_progress)],
-                    "logger": YDLLogger(),
-                    "quiet": True,
-                    "no_warnings": True,
-                }
-                with YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([task.url])
-                update_status(f"✅ Done. Saved to: {task.output_dir}")
-        except Exception as e:
-            Logger.error(f"_run_task: {e}")
-            update_status(f"❌ Error: {e}")
-
-def progress_hook(d, update_status, update_progress):
-    status = d.get("status", "")
-    if status == "downloading":
-        total = d.get("total_bytes") or d.get("total_bytes_estimate")
-        downloaded = d.get("downloaded_bytes", 0)
-        if total:
-            pct = int(downloaded * 100 / total)
-            update_progress(pct)
-        update_status("Downloading…")
-    elif status == "finished":
-        update_status("Finished")
-        update_progress(100)
-
-
-def start_music_service():
-    global service
-    if not service:
-        service = PythonService.start('musicservice', 'service.py')
-
-def stop_music_service():
-    global service
-    if service:
-        service.stop()
-        service = None
-
-# ---------- App ----------
+def ensure_android_permissions():
+    if not ANDROID: return
+    try:
+        perms = [Permission.WRITE_EXTERNAL_STORAGE, Permission.READ_EXTERNAL_STORAGE]
+        missing = [p for p in perms if not check_permission(p)]
+        if missing:
+            request_permissions(perms)
+    except Exception as e:
+        Logger.error(f"Error requesting permissions: {e}")
 
 class YouTubeMP3App(App):
     def build(self):
-        # explicitly load main.kv (keep file name main.kv)
         kv_path = os.path.join(os.path.dirname(__file__), "main.kv")
         if os.path.exists(kv_path):
             Builder.load_file(kv_path)
         else:
-            Logger.warning("main.kv not found next to main.py; make sure main.kv exists in the same folder")
-
-        root = Root()
-        root.schedule_cleanup()
-        return root
+            Logger.warning("main.kv not found!")
+        return Root()
 
     def on_stop(self):
-        try:
-            if hasattr(self, 'root') and self.root:
-                self.root.stop_playback()
-                self.root.cleanup_all_temp_files()
-        except Exception:
-            pass
+        if ANDROID:
+            # The app is stopping, tell the service to stop as well
+            if self.root and self.root.player:
+                self.root.player.stop()
+            stop_music_service()
+        elif self.root and self.root.player:
+            self.root.player.release()
 
 if __name__ == "__main__":
     YouTubeMP3App().run()
-
-# Example: call this in your play logic
-if ANDROID:
-    start_music_service()
-
-def play_in_background(self, file_path):
-    # Write command to a file
-    cmd_file = os.path.join(get_download_root(), "service_cmd.txt")
-    with open(cmd_file, "w") as f:
-        f.write(f"PLAY|{file_path}")
-    if ANDROID:
-        start_music_service()
-
-def pause_in_background(self):
-    cmd_file = os.path.join(get_download_root(), "service_cmd.txt")
-    with open(cmd_file, "w") as f:
-        f.write("PAUSE")
-
-def stop_in_background(self):
-    cmd_file = os.path.join(get_download_root(), "service_cmd.txt")
-    with open(cmd_file, "w") as f:
-        f.write("STOP")
-    if ANDROID:
-        stop_music_service()

@@ -58,7 +58,7 @@ p4a.cython = 0.29.33
 orientation = portrait
 
 # (list) List of service to declare
-services = musicservice:service.py
+services = MusicService:service.py
 
 #
 # OSX Specific
