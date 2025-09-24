@@ -31,4 +31,4 @@ urllib3==2.5.0
 virtualenv==20.34.0
 wheel==0.43.0
 youtube-dl==2021.12.17
-yt-dlp==2025.8.27
+yt-dlp
