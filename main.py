@@ -176,7 +176,9 @@ class YDLLogger:
 def is_playlist_url(url: str) -> bool: return "playlist" in url.lower() or "list=" in url.lower()
 
 def extract_playlist_info(playlist_url: str) -> (list, list):
-    opts = {"quiet": True, "extract_flat": "in_playlist", "skip_download": True}
+    cache_dir = os.path.join(get_app_files_dir(), 'yt_dlp_cache')
+    os.makedirs(cache_dir, exist_ok=True)
+    opts = {"quiet": True, "extract_flat": "in_playlist", "skip_download": True, "cachedir": cache_dir}
     urls, titles = [], []
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(playlist_url, download=False)
@@ -190,7 +192,9 @@ def extract_playlist_info(playlist_url: str) -> (list, list):
 def download_for_streaming(video_url: str):
     try:
         temp_dir = get_temp_dir()
-        opts_info = {"quiet": True, "no_warnings": True, "format": "bestaudio[ext=m4a]/bestaudio/best", "skip_download": True, "logger": YDLLogger()}
+        cache_dir = os.path.join(get_app_files_dir(), 'yt_dlp_cache')
+        os.makedirs(cache_dir, exist_ok=True)
+        opts_info = {"quiet": True, "no_warnings": True, "format": "bestaudio[ext=m4a]/bestaudio/best", "skip_download": True, "logger": YDLLogger(), "cachedir": cache_dir}
         with YoutubeDL(opts_info) as ydl:
             info = ydl.extract_info(video_url, download=False)
             if not info: return None, None, None
@@ -202,7 +206,7 @@ def download_for_streaming(video_url: str):
         if os.path.exists(temp_path):
             return temp_path, title, duration
             
-        opts = {"quiet": True, "no_warnings": True, "format": "bestaudio[ext=m4a]/bestaudio/best", "outtmpl": temp_path, "logger": YDLLogger()}
+        opts = {"quiet": True, "no_warnings": True, "format": "bestaudio[ext=m4a]/bestaudio/best", "outtmpl": temp_path, "logger": YDLLogger(), "cachedir": cache_dir}
         with YoutubeDL(opts) as ydl:
             ydl.extract_info(video_url, download=True)
             
@@ -484,14 +488,36 @@ class Root(BoxLayout):
 
     def _run_task(self, task: DownloadTask):
         try:
+            cache_dir = os.path.join(get_app_files_dir(), 'yt_dlp_cache')
+            os.makedirs(cache_dir, exist_ok=True)
+            # Use App.get_running_app().directory for a reliable path to the app's root
+            if ANDROID:
+                # On Android, ffmpeg is usually not bundled this way.
+                # The user would need a build with ffmpeg included.
+                # For now, we assume it's in the PATH or not available.
+                ffmpeg_path = None
+            else:
+                ffmpeg_path = os.path.join(App.get_running_app().directory, 'ffmpeg')
+
             ydl_opts = {
+                "cachedir": cache_dir,
                 "format": "bestaudio/best",
-                "outtmpl": os.path.join(task.output_dir, "%(title)s.%(ext)s"),
                 "noplaylist": not task.is_playlist,
                 "ignoreerrors": True,
                 "logger": YDLLogger(),
                 "quiet": True,
+                "postprocessors": [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }],
+                "outtmpl": os.path.join(task.output_dir, "%(title)s.mp3"),
+                'keepvideo': False,
             }
+            
+            if ffmpeg_path:
+                ydl_opts['ffmpeg_location'] = ffmpeg_path
+
             with YoutubeDL(ydl_opts) as ydl:
                 ydl.download([task.url])
             self.set_status(f"✅ Done. Saved to: {task.output_dir}")

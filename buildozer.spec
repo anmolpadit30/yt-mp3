@@ -113,7 +113,7 @@ android.permissions = android.permission.INTERNET, android.permission.WAKE_LOCK,
 #android.features = android.hardware.usb.host
 
 # (int) Target Android API, should be as high as possible.
-android.api = 31
+android.api = 33
 
 # (int) Minimum API your APK / AAB will support.
 android.minapi = 24
@@ -192,7 +192,7 @@ android.ndk = 25b
 #android.add_src =
 
 # (list) Android AAR archives to add
-android.add_aars = libs/vlc/libvlc-all-3.6.aar
+# android.add_aars = libs/vlc/libvlc-all-3.6.aar
 
 # (list) Put these files or directories in the apk assets directory.
 # Either form may be used, and assets need not be in 'source.include_exts'.
@@ -218,7 +218,7 @@ android.add_aars = libs/vlc/libvlc-all-3.6.aar
 # (bool) Enable AndroidX support. Enable when 'android.gradle_dependencies'
 # contains an 'androidx' package, or any package from Kotlin source.
 # android.enable_androidx requires android.api >= 33
-#android.enable_androidx = True
+android.enable_androidx = True
 
 # (list) add java compile options
 # this can for example be necessary when importing certain java libraries using the 'android.gradle_dependencies' option
